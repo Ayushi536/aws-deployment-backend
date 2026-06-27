@@ -1,0 +1,23 @@
+{
+  "name": "aws-deployment-backend",
+  "version": "1.0.0",
+  "description": "Production Node.js/Express backend — AWS EC2 + PM2 + Winston + Incident Notifier",
+  "main": "app.js",
+  "scripts": {
+    "start": "node app.js",
+    "dev": "nodemon app.js",
+    "pm2:start": "pm2 start ecosystem.config.js --env production",
+    "pm2:reload": "pm2 reload ecosystem.config.js --env production",
+    "pm2:stop": "pm2 stop aws-deployment-backend",
+    "pm2:logs": "pm2 logs aws-deployment-backend"
+  },
+  "dependencies": {
+    "axios": "^1.7.2",
+    "dotenv": "^16.4.5",
+    "express": "^4.19.2",
+    "winston": "^3.13.0"
+  },
+  "devDependencies": {
+    "nodemon": "^3.1.4"
+  }
+}
