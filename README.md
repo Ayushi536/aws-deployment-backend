@@ -81,17 +81,35 @@ Hit `GET /test-error` to trigger a test 500 error and verify that:
 pm2 start ecosystem.config.js --env production
 ```
 
-### 2. Make PM2 survive server reboots
+### 2. Register PM2 as a system service
+
+By default, PM2 restarts the app if it **crashes**. But if the EC2 server itself **reboots** (e.g. AWS maintenance, power cycle), PM2 does not start automatically — the app stays down until someone SSH's in and starts it manually.
+
+`pm2 startup` fixes this by registering PM2 as a system-level service (like a daemon), so the OS automatically starts PM2 — and PM2 starts your app — every time the server boots.
 
 ```bash
 pm2 startup
-# Copy and run the exact command PM2 outputs
-
-pm2 save
-# Saves current process list — restored on every reboot
 ```
 
-### 3. Verify
+PM2 will print a `sudo` command specific to your server's OS. **Copy that exact command and run it.** It looks something like:
+
+```bash
+sudo env PATH=$PATH:/usr/bin pm2 startup systemd -u ubuntu --hp /home/ubuntu
+```
+
+Do not type this manually — always use the one PM2 prints for your machine.
+
+### 3. Save the current process list
+
+`pm2 startup` makes PM2 start on boot, but PM2 needs to know **which apps** to start. `pm2 save` takes a snapshot of all currently running PM2 processes and saves it to disk. On every reboot, PM2 reads this snapshot and restores exactly those processes.
+
+```bash
+pm2 save
+```
+
+> **Important:** Run `pm2 save` every time you add or remove an app from PM2. If you start a new process but forget to run `pm2 save`, it won't be restored after a reboot.
+
+### 4. Verify
 
 ```bash
 pm2 list              # should show status: online
@@ -103,21 +121,31 @@ curl http://localhost:3000   # should return { status: "ok" }
 
 ## Auto-Deploy via GitHub Actions
 
-Every push to `main` automatically deploys to EC2.
+Every push to `main` automatically deploys to EC2. The workflow in `.github/workflows/deploy.yml` SSH's into the EC2 instance and runs `git pull` + `npm install` + `pm2 reload` — all without any manual work.
 
-### GitHub Secrets to set (Settings → Secrets → Actions)
+### Step 1 — Add GitHub Secrets
 
-| Secret | Value |
-|---|---|
-| `EC2_HOST` | Public IP of your EC2 instance |
-| `EC2_USER` | SSH username (usually `ubuntu`) |
-| `EC2_PRIVATE_KEY` | Full contents of your `.pem` key file |
+GitHub Actions needs to SSH into your EC2 instance. Instead of hardcoding credentials in the workflow file (which is public), GitHub lets you store them as encrypted **Secrets** that the workflow reads at runtime.
 
-Once set, every `git push origin main` triggers:
-1. SSH into EC2
-2. `git pull origin main`
-3. `npm install --production`
-4. `pm2 reload` (zero downtime)
+Go to your GitHub repo → **Settings → Secrets and variables → Actions → New repository secret** and add these three:
+
+| Secret | What to put | Where to find it |
+|---|---|---|
+| `EC2_HOST` | Public IP of your EC2 instance | AWS Console → EC2 → Instances → your instance → Public IPv4 address |
+| `EC2_USER` | SSH username | Usually `ubuntu` for Ubuntu-based EC2 instances |
+| `EC2_PRIVATE_KEY` | Full contents of your `.pem` key file | Open the `.pem` file in a text editor, copy everything including `-----BEGIN RSA PRIVATE KEY-----` and `-----END RSA PRIVATE KEY-----` |
+
+> **Why Secrets and not the workflow file directly?** The `deploy.yml` is committed to the repo and visible to anyone. Secrets are encrypted and only injected into the workflow at runtime — they are never exposed in logs or code.
+
+### Step 2 — Push to main
+
+Once secrets are set, every `git push origin main` automatically triggers:
+
+1. GitHub spins up a runner (Ubuntu VM)
+2. SSH's into your EC2 using the secrets
+3. Runs `git pull origin main`
+4. Runs `npm install --production`
+5. Runs `pm2 reload` — zero downtime, existing connections are not dropped
 
 ---
 
