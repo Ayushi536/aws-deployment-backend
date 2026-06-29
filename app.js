@@ -65,10 +65,18 @@ app.use((err, req, res, next) => {
     // fire-and-forget — does NOT delay the response to the user
   }
 
-  // Step 3: Send clean JSON response (no raw stack traces exposed)
+  // Step 3: Send structured JSON error response
+  // In production: hides raw error message from client (security)
+  // In development: shows actual error message for easier debugging
   res.status(statusCode).json({
-    error: "Something went wrong",
-    ...(process.env.NODE_ENV !== "production" && { detail: err.message }),
+    success:    false,
+    statusCode: statusCode,
+    error:      err.name || "Internal Server Error",
+    message:    statusCode === 500 && process.env.NODE_ENV === "production"
+                  ? "An unexpected error occurred. Please try again later."
+                  : err.message,
+    path:       req.originalUrl,
+    timestamp:  new Date().toISOString(),
   });
 });
 
