@@ -31,11 +31,26 @@ require("dotenv").config();
 // ============================================================
 
 const axios = require("axios");
+const { S3Client, GetObjectCommand } = require("@aws-sdk/client-s3");
 const createAimsIncident = require("./aimsIncident");
 
 const BACKEND_HEALTH_URL = process.env.BACKEND_HEALTH_URL;
 const FRONTEND_URL = process.env.FRONTEND_URL;
 const CHECK_INTERVAL_MINUTES = Number(process.env.CHECK_INTERVAL_MINUTES) || 5;
+
+// ── Backup heartbeat staleness check ────────────────────────────
+// backup-s3.js (mongo-backup-repo) uploads a heartbeat.json to S3 after
+// every run. If that heartbeat gets too old, it means the backup script
+// itself has stopped firing (cron died, machine off, etc.) — not the same
+// thing as "a backup attempt failed", which backup-s3.js already reports
+// on its own. This catches the "didn't even run" case.
+const S3_BUCKET = process.env.S3_BUCKET_NAME;
+const AWS_REGION = process.env.AWS_REGION || "ap-south-1";
+const HEARTBEAT_S3_KEY = "heartbeats/backup-s3-heartbeat.json";
+// Backup is expected to run roughly daily — flag it stale after 36h to give
+// some slack (matches the example used while discussing this with Madhav).
+const HEARTBEAT_STALE_AFTER_HOURS = Number(process.env.HEARTBEAT_STALE_AFTER_HOURS) || 36;
+const s3 = new S3Client({ region: AWS_REGION });
 
 if (!BACKEND_HEALTH_URL || !FRONTEND_URL) {
   console.error("[ERROR] BACKEND_HEALTH_URL and FRONTEND_URL must be set in .env");
@@ -47,6 +62,7 @@ if (!BACKEND_HEALTH_URL || !FRONTEND_URL) {
 let backendWasUp = true;
 let frontendWasUp = true;
 let dbWasUp = true;
+let backupHeartbeatWasFresh = true;
 
 async function checkBackend() {
   try {
@@ -125,10 +141,61 @@ async function checkFrontend() {
   }
 }
 
+async function checkBackupHeartbeat() {
+  if (!S3_BUCKET) {
+    console.log("[watchdog] S3_BUCKET_NAME not set — skipping backup heartbeat check.");
+    return;
+  }
+
+  try {
+    const res = await s3.send(
+      new GetObjectCommand({ Bucket: S3_BUCKET, Key: HEARTBEAT_S3_KEY })
+    );
+    const body = await res.Body.transformToString();
+    const heartbeat = JSON.parse(body);
+
+    const lastRunAt = new Date(heartbeat.lastRunAt);
+    const hoursSinceLastRun = (Date.now() - lastRunAt.getTime()) / (1000 * 60 * 60);
+    const isFresh = hoursSinceLastRun <= HEARTBEAT_STALE_AFTER_HOURS;
+
+    if (!isFresh && backupHeartbeatWasFresh) {
+      await createAimsIncident({
+        title: "MongoDB S3 backup heartbeat is stale",
+        description: `backup-s3.js last reported success at ${heartbeat.lastRunAt} (${hoursSinceLastRun.toFixed(
+          1
+        )}h ago), which is past the ${HEARTBEAT_STALE_AFTER_HOURS}h threshold. The backup script may have stopped running.`,
+        severity: "Critical",
+        categoryName: "Database",
+        source: "watchdog",
+      });
+    }
+    backupHeartbeatWasFresh = isFresh;
+
+    console.log(
+      `[watchdog] Backup heartbeat: ${isFresh ? "FRESH" : "STALE"} (last run ${hoursSinceLastRun.toFixed(1)}h ago, status: ${heartbeat.status})`
+    );
+  } catch (err) {
+    // Heartbeat file missing entirely is itself a signal the backup has
+    // never run (or the bucket/key is misconfigured) — treat as stale too.
+    if (backupHeartbeatWasFresh) {
+      await createAimsIncident({
+        title: "MongoDB S3 backup heartbeat missing",
+        description: `Could not read heartbeat from s3://${S3_BUCKET}/${HEARTBEAT_S3_KEY}. Error: ${err.message}`,
+        severity: "High",
+        categoryName: "Database",
+        source: "watchdog",
+      });
+    }
+    backupHeartbeatWasFresh = false;
+    console.log("[watchdog] Backup heartbeat: STALE/MISSING (could not read from S3)");
+  }
+}
+
 async function runChecks() {
   console.log(`\n[watchdog] Running checks at ${new Date().toISOString()}`);
   await checkBackend();
   await checkFrontend();
+  await checkBackupHeartbeat();
 }
 
 // Run immediately, then on an interval
