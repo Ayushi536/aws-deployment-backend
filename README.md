@@ -12,7 +12,8 @@ Covers auto-deploy, crash recovery, error logging, and real-time incident alerts
 | Auto-Deploy | `.github/workflows/deploy.yml` | GitHub push → EC2 auto-deploy via SSH |
 | PM2 Crash Recovery | `ecosystem.config.js` | App survives crashes and server reboots |
 | Global Error Logging | `logger.js` + `app.js` | Winston logs every error with route, stack, timestamp |
-| Incident Notification | `incidentNotifier.js` + `app.js` | Fires webhook on every 500 error (Slack/PagerDuty/OpsGenie) |
+| Incident Notification | `incidentNotifier.js` + `aimsIncident.js` | Backend 500 errors raise an incident **directly in AIMS** (no longer a generic webhook) |
+| Uptime Watchdog | `watchdog.js` | Pings backend `/health` + frontend, reads DB status from the backend's own response, and checks the mongo-backup repo's S3 heartbeat for staleness |
 
 ---
 
@@ -26,7 +27,9 @@ aws-deployment-backend/
 ├── logs/                      ← Winston log files (gitignored)
 ├── app.js                     ← Main Express app + global error middleware
 ├── logger.js                  ← Winston logger setup
-├── incidentNotifier.js        ← Fires HTTP POST to incident webhook on 500
+├── incidentNotifier.js        ← Calls AIMS incident API directly on backend errors
+├── aimsIncident.js            ← Shared helper, raises incidents in AIMS (same copy lives in mongo repo)
+├── watchdog.js                ← Uptime monitor: backend, frontend, DB, and backup heartbeat staleness
 ├── ecosystem.config.js        ← PM2 config (crash recovery + reboot survival)
 ├── .env.example               ← Copy to .env and fill in values
 ├── .gitignore
@@ -53,7 +56,10 @@ Then open `.env` and set:
 
 - `PORT` — port to run the server on (default: 3000)
 - `NODE_ENV` — `production` on EC2
-- `INCIDENT_WEBHOOK_URL` — Slack / PagerDuty / OpsGenie / custom webhook URL
+- `AIMS_BASE_URL` — AIMS incident API base URL (`https://aims.erpica.in/api/v1/public/incidents`)
+- `AIMS_API_KEY` — AIMS API key (must match the value used in the mongo-backup repo)
+- `BACKEND_HEALTH_URL`, `FRONTEND_URL`, `CHECK_INTERVAL_MINUTES` — used by `watchdog.js`
+- `S3_BUCKET_NAME`, `AWS_REGION`, `HEARTBEAT_STALE_AFTER_HOURS` — used by `watchdog.js` to check the backup heartbeat (must match the S3 bucket/region used in the mongo-backup repo)
 
 ---
 
@@ -69,7 +75,14 @@ npm start
 
 Hit `GET /test-error` to trigger a test 500 error and verify that:
 - Winston writes to `logs/error.log`
-- `incidentNotifier.js` fires to your webhook
+- `incidentNotifier.js` fires and creates an incident directly in AIMS
+
+To run the watchdog (separately, ideally under PM2 too):
+
+```bash
+node watchdog.js
+# or: pm2 start watchdog.js
+```
 
 ---
 
@@ -162,13 +175,28 @@ Global middleware (app.js — last app.use)
       ↓
 Winston logs it → logs/error.log
       ↓
-If 500 → incidentNotifier fires (non-blocking)
+If 500 → incidentNotifier fires → aimsIncident.js → AIMS (non-blocking)
       ↓
 Clean JSON response sent to user
 ```
 
-**Zero changes needed in any route file.**  
+**Zero changes needed in any route file.**
 Works for 10 routes or 10,000 routes — same single setup.
+
+`incidentNotifier.js` keeps the same function signature as before (`notifyIncident({ title, route, method, statusCode, error, timestamp })`), so `app.js` needed no changes to switch from a generic webhook to calling AIMS directly — only `incidentNotifier.js`'s internals changed.
+
+---
+
+## Watchdog — `watchdog.js`
+
+Runs continuously (intended to be started under PM2: `pm2 start watchdog.js`), checking every `CHECK_INTERVAL_MINUTES` (default 5):
+
+1. **Backend** — pings `BACKEND_HEALTH_URL`. Down → AIMS incident.
+2. **Frontend** — pings `FRONTEND_URL`. Down → AIMS incident.
+3. **Database** — read from the backend's own `/health` response (`{ db: "connected" | "disconnected" }`) rather than opening a separate DB connection, per Madhav's instruction. Disconnected → AIMS incident.
+4. **Backup heartbeat staleness** — reads `heartbeats/backup-s3-heartbeat.json` from the same S3 bucket `backup-s3.js` (mongo-backup repo) writes to. If the last successful backup run is older than `HEARTBEAT_STALE_AFTER_HOURS` (default 36h), or the heartbeat is missing entirely, raises an AIMS incident. This catches the case where the backup *script itself stopped running* (cron died, machine off) — different from a backup attempt that ran and failed, which `backup-s3.js` already reports on its own.
+
+All four checks only raise a new incident on a state change (up→down, fresh→stale), not on every poll, to avoid incident spam. All four use the same shared `aimsIncident.js` helper as `incidentNotifier.js`.
 
 ---
 
@@ -184,7 +212,8 @@ Requires AWS Console access to configure SNS topic + CloudWatch alarms.
 - Node.js + Express
 - PM2 (process manager)
 - Winston (error logging)
-- axios (incident webhook HTTP calls)
+- axios (AIMS API calls)
+- `@aws-sdk/client-s3` (reading the backup heartbeat from S3)
 - AWS EC2 (Ubuntu)
 - GitHub Actions (CI/CD)
 - `.env` for secrets
@@ -199,6 +228,8 @@ Requires AWS Console access to configure SNS topic + CloudWatch alarms.
 | CloudWatch CPU/Memory Alerts | Pending — needs AWS Console |
 | PM2 Crash Recovery | ✅ Verified locally |
 | Winston Error Logging | ✅ Verified locally |
-| Incident Notifier (500 errors) | ✅ Code complete — needs live webhook URL |
+| Incident Notifier → AIMS directly | ✅ Code complete; AIMS API key still needs confirmation (real vs. placeholder) |
+| Watchdog (backend/frontend/DB) | ✅ Built, not yet tested against production endpoints |
+| Watchdog backup-heartbeat check | ✅ Built and locally syntax-checked; not yet tested end-to-end with a real S3 bucket |
 
 *Ayushi Sharma — SDE Intern, Temflo Systems Pvt. Ltd.*
